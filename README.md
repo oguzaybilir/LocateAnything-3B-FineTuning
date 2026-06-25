@@ -73,6 +73,43 @@ All changes live in `train_lora.py` (training) and the inference scripts, and ar
 **Result:** peak ~21.8 GB at `--max-side 1280`, micro-batch 1, grad-accum 8, LoRA r=16. Launch with
 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
 
+## Why `slow` is the default — Parallel Box Decoding ablation
+
+LocateAnything's headline feature is **Parallel Box Decoding (PBD)** — the `fast` (MTP-only) and `hybrid`
+(MTP + AR fallback) decoding modes. Its *training* objective requires MagiAttention (Hopper / Blackwell), so on
+Ampere we can only LoRA-fine-tune the **autoregressive (`slow`)** path. The PBD heads stay at their pretrained
+state, never adapted to the new classes.
+
+The catch: PBD still *runs* at inference on a 3090 — it just produces garbage. Evaluating the same LoRA adapter
+under all three decoding modes on a held-out validation set (overall, IoU @ 0.5):
+
+| Decoding mode | Precision | Recall | **F1** | predicted FPs |
+|---|---|---|---|---|
+| Base, no fine-tune (`slow`) | 0.70 | 0.36 | 0.47 | 20 |
+| **Fine-tuned · `slow` (AR)** | **0.79** | **0.77** | **0.78** | 26 |
+| Fine-tuned · `hybrid` (PBD) | 0.04 | 0.69 | 0.07 | **2,355** |
+| Fine-tuned · `fast` (PBD) | 0.03 | 0.64 | 0.06 | **2,370** |
+
+Speed on the same run (single RTX 3090):
+
+| Mode | img/s | sec/img | boxes/s |
+|---|---|---|---|
+| `slow` | 0.29 | 3.49 | 0.62 |
+| `hybrid` | 0.22 | 4.46 | 9.76 |
+| `fast` | 0.24 | 4.18 | 10.13 |
+
+Because the parallel box-count heads were never fine-tuned, `fast`/`hybrid` flood the output with thousands of
+false-positive boxes — precision collapses to ~0.03 and F1 drops from **0.78 → 0.07**. The PBD speed advantage
+doesn't even materialize: per-image throughput (`img/s`) is actually *worse* than `slow`, because generating that
+flood of boxes takes longer (the high `boxes/s` is just garbage volume).
+
+**Takeaway:** on a fine-tuned-on-Ampere model, use `--gen-mode slow` (the default). Reproduce the table yourself
+with:
+
+```bash
+python eval_compare.py --gen-modes slow,hybrid,fast
+```
+
 ## Environment
 
 `transformers` **must be pinned to `4.57.1`** — transformers 5.x breaks the model's remote code
