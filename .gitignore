@@ -1,0 +1,31 @@
+# --- model weights (download base from HF: nvidia/LocateAnything-3B) ---
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# --- private dataset & anything derived from it (NEVER commit) ---
+dataset/
+dataset.jsonl
+*.jsonl
+examples/
+eval_vis/
+predictions/
+lora_out/
+*_pred.png
+
+# --- training / eval run artifacts ---
+eval_preds.json
+trainer_state.json
+training_args.bin
+all_results.json
+*.log
+*.docx
+
+# --- python / env junk ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
