@@ -3,12 +3,19 @@
 
 Loads the base model once, attaches the LoRA adapter, and evaluates both the
 base (adapter disabled) and the fine-tuned (adapter enabled) model on the same
-val images. Reports precision / recall / F1 at IoU 0.5 per category.
+val images. Reports precision / recall / F1 at IoU 0.5 / 0.95 per category.
+
+The fine-tuned model can be evaluated under several decoding modes at once via
+`--gen-modes slow,hybrid,fast` to compare LocateAnything's Parallel Box Decoding
+(`fast` = MTP only, `hybrid` = MTP + AR fallback) against the pure autoregressive
+path (`slow`, which is the one the LoRA SFT actually trains). A per-mode speed /
+throughput table is printed so you can see the quality-vs-latency tradeoff.
 """
 import argparse
 import json
 import re
 import sys
+import time
 
 import torch
 from PIL import Image
@@ -61,7 +68,7 @@ def match(preds, gts, thr=0.5):
 
 
 @torch.no_grad()
-def predict(model, tok, proc, img, query, max_side, device):
+def predict(model, tok, proc, img, query, max_side, device, gen_mode="slow"):
     w, h = img.size
     s = max_side / max(w, h)
     if s < 1:
@@ -73,7 +80,7 @@ def predict(model, tok, proc, img, query, max_side, device):
     resp = model.generate(
         pixel_values=inputs["pixel_values"].to(torch.bfloat16), input_ids=inputs["input_ids"],
         attention_mask=inputs["attention_mask"], image_grid_hws=inputs.get("image_grid_hws"),
-        tokenizer=tok, max_new_tokens=512, use_cache=True, generation_mode="slow",
+        tokenizer=tok, max_new_tokens=512, use_cache=True, generation_mode=gen_mode,
         do_sample=False, verbose=False)
     return resp[0] if isinstance(resp, tuple) else resp
 
@@ -129,6 +136,11 @@ def main():
     ap.add_argument("--max-side", type=int, default=1280)
     ap.add_argument("--limit", type=int, default=0, help="limit number of val images (0=all)")
     ap.add_argument("--dump", default="eval_preds.json", help="save predictions+GT for visualization")
+    ap.add_argument("--gen-modes", default="slow",
+                    help="comma-separated decoding modes to evaluate the fine-tuned model in: "
+                         "any of slow,hybrid,fast (e.g. --gen-modes slow,hybrid,fast)")
+    ap.add_argument("--base-mode", default="slow", choices=["slow", "hybrid", "fast"],
+                    help="decoding mode for the base reference (default: slow)")
     args = ap.parse_args()
     device = "cuda"
 
@@ -149,33 +161,65 @@ def main():
     cats = val[0]["categories"]
     query = val[0]["conversations"][0]["value"]
 
+    modes = [m.strip() for m in args.gen_modes.split(",") if m.strip()]
+    for m in modes:
+        assert m in ("slow", "hybrid", "fast"), f"bad --gen-modes entry: {m!r}"
+    print(f"fine-tuned decoding modes: {modes}   base reference: {args.base_mode}")
+
+    # wall-clock + predicted-box counts per fine-tuned mode (PBD speed payoff)
+    timing = {m: 0.0 for m in modes}
+    boxcount = {m: 0 for m in modes}
+
     samples = []
     for i, r in enumerate(val):
         img = Image.open(r["image"]).convert("RGB")
         with model.language_model.disable_adapter():
-            base_ans = predict(model, tok, proc, img, query, args.max_side, device)
-        tuned_ans = predict(model, tok, proc, img, query, args.max_side, device)
-        samples.append({
+            base_ans = predict(model, tok, proc, img, query, args.max_side, device, args.base_mode)
+        rec = {
             "image": r["image"],
             "image_width": r["image_width"],
             "image_height": r["image_height"],
             "gt": r["objects"],
             "base": parse_pred(base_ans),
-            "tuned": parse_pred(tuned_ans),
-        })
+        }
+        for m in modes:
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            ans = predict(model, tok, proc, img, query, args.max_side, device, m)
+            torch.cuda.synchronize()
+            timing[m] += time.perf_counter() - t0
+            pred = parse_pred(ans)
+            rec[f"tuned__{m}"] = pred
+            boxcount[m] += sum(len(v) for v in pred.values())
+        # primary mode kept under "tuned" for visualize_eval.py compatibility
+        rec["tuned"] = rec[f"tuned__{modes[0]}"]
+        samples.append(rec)
         print(f"[{i+1}/{len(val)}] {r['image'].split('/')[-1]}", flush=True)
 
     if args.dump:
         with open(args.dump, "w") as f:
-            json.dump({"categories": cats, "query": query, "samples": samples}, f)
+            json.dump({"categories": cats, "query": query, "modes": modes,
+                       "samples": samples}, f)
         print(f"\nsaved predictions -> {args.dump}")
 
     for thr in (0.5, 0.95):
         print(f"\n############### IoU @ {thr} ###############")
-        print("================ BASE (no fine-tune) ================")
+        print(f"================ BASE · {args.base_mode} (no fine-tune) ================")
         report(samples, cats, "base", thr)
-        print("\n================ FINE-TUNED (LoRA) ==================")
-        report(samples, cats, "tuned", thr)
+        for m in modes:
+            print(f"\n========== FINE-TUNED (LoRA) · gen-mode={m} ==========")
+            report(samples, cats, f"tuned__{m}", thr)
+
+    # speed / throughput summary — the Parallel Box Decoding payoff
+    n = len(val)
+    print("\n############### SPEED (fine-tuned) ###############")
+    print(f"{'mode':<10} {'img/s':>8} {'sec/img':>9} {'boxes/s':>9}")
+    print("-" * 40)
+    for m in modes:
+        ips = n / timing[m] if timing[m] else 0.0
+        spi = timing[m] / n if n else 0.0
+        bps = boxcount[m] / timing[m] if timing[m] else 0.0
+        print(f"{m:<10} {ips:>8.2f} {spi:>9.3f} {bps:>9.2f}")
 
 
 if __name__ == "__main__":
